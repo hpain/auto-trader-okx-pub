@@ -1,0 +1,422 @@
+import logging
+import numpy as np
+import pandas as pd
+import json
+import os
+import pickle
+import math
+from typing import Dict, List, Optional, Tuple
+
+# Try importing torch, handle if not installed yet (for dry-run)
+try:
+    import torch
+    import torch.nn as nn
+    import torch.optim as optim
+    from torch.utils.data import DataLoader, TensorDataset
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
+    
+from features.tensor_loader import create_lazy_loader
+
+class PositionalEncoding(nn.Module if HAS_TORCH else object):
+    """
+    Injects some information about the relative or absolute position of the tokens in the sequence.
+    The positional encodings have the same dimension as the embeddings, so that the two can be summed.
+    """
+    def __init__(self, d_model, dropout=0.1, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        
+        pe = pe.unsqueeze(0) # [1, max_len, d_model]
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        # x: [Batch, Seq_Len, d_model]
+        x = x + self.pe[:, :x.size(1), :]
+        return self.dropout(x)
+
+class TimeSeriesTransformer(nn.Module if HAS_TORCH else object):
+    """
+    Advanced Transformer for Time Series Forecasting.
+
+    This version includes additional improvements:
+    - Residual connections and layer normalization
+    - Adaptive gradient clipping
+    - Better attention mechanisms
+    - Enhanced regularization
+
+    Input: (Batch, Seq_Len, Features)
+    Output: (Batch, 1) -> Binary Classification via Logits
+    """
+    def __init__(self, input_dim, d_model=96, nhead=6, num_layers=3, dropout=0.2):
+        super(TimeSeriesTransformer, self).__init__()
+
+        # 1. Input Projection with Dropout
+        self.input_dropout = nn.Dropout(dropout)
+        self.embedding = nn.Linear(input_dim, d_model)
+
+        # 2. Positional Encoding
+        self.pos_encoder = PositionalEncoding(d_model, dropout)
+
+        # 3. Transformer Encoder Layers with enhanced architecture
+        # Create a single encoder layer template
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=d_model * 4,  # Larger FF layer for more capacity
+            batch_first=True,
+            dropout=dropout,
+            activation='gelu',  # Use GELU activation for better performance
+            layer_norm_eps=1e-5  # Smaller epsilon for numerical stability
+        )
+
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers
+        )
+
+        # 4. Output Head for 3-class classification
+        self.norm1 = nn.LayerNorm(d_model)
+        self.intermediate = nn.Linear(d_model, d_model // 2)
+        self.norm2 = nn.LayerNorm(d_model // 2)
+        self.activation = nn.GELU()
+        self.output_dropout = nn.Dropout(dropout)
+        # Change output dimension from 1 (binary) to 3 (multiclass) for [timeout, stop_loss, take_profit]
+        self.decoder = nn.Linear(d_model // 2, 3)
+
+        self.input_dim = input_dim
+        self.d_model = d_model
+
+    def forward(self, src):
+        # src: [Batch, Seq_Len, Features]
+
+        # Input dropout for regularization
+        x = self.input_dropout(src)
+
+        # Embed inputs
+        x = self.embedding(x)  # [Batch, Seq_Len, d_model]
+        x = self.pos_encoder(x)
+
+        # Transformer
+        x = self.transformer_encoder(x)
+
+        # Global Average Pooling
+        x = torch.mean(x, dim=1)
+
+        # Apply layer norm before intermediate layer
+        x = self.norm1(x)
+
+        # Intermediate layer with activation
+        x = self.intermediate(x)
+        x = self.activation(x)
+
+        # Apply layer norm before output
+        x = self.norm2(x)
+
+        # Output with dropout
+        x = self.output_dropout(x)
+        prediction = self.decoder(x)
+
+        # Ensure output is float32 to match expected types for loss function
+        return prediction.float()
+
+class TransformerStrategy:
+    """
+    Transformer-based Trading Strategy (Phase 2 Upgrade).
+    Hardware Agnostic: Runs on CPU or CUDA.
+    Memory Optimized: Uses Lazy Loading for low RAM environments.
+    """
+    def __init__(self, strategy_name="Transformer_v2", window_size=60, features=None, buy_threshold=0.60, sell_threshold=0.40):
+        self.logger = logging.getLogger(__name__)
+        self.strategy_name = strategy_name
+        self.window_size = window_size
+        self.features = features or ['close', 'volume'] # Should be set dynamically
+        
+        # Dynamic Thresholds
+        self.buy_threshold = buy_threshold
+        self.sell_threshold = sell_threshold
+        self.logger.info(f"Thresholds -> Buy: {self.buy_threshold}, Sell: {self.sell_threshold}")
+        
+        self.device = 'cpu'
+        self.model = None
+        self.scaler = None
+        
+        if HAS_TORCH:
+            self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            self.logger.info(f"TransformerStrategy initialized on DEVICE: {self.device.upper()}")
+        else:
+            self.logger.warning("PyTorch not installed. Strategy disabled.")
+
+    def build_model(self, input_dim, d_model=72, nhead=6, num_layers=2, dropout=0.25, lr=0.0001):
+        if not HAS_TORCH: return
+        self.model = TimeSeriesTransformer(
+            input_dim=input_dim,
+            d_model=d_model,
+            nhead=nhead,
+            num_layers=num_layers,
+            dropout=dropout
+        ).to(self.device).float()
+
+        # Initialize weights using Xavier/Glorot initialization for better convergence
+        def init_weights(m):
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Embedding):
+                nn.init.normal_(m.weight, mean=0, std=0.1)
+
+        # Initialize weights with proper data types
+        def init_weights_proper(m):
+            if isinstance(m, nn.Linear):
+                # Use Xavier uniform initialization with proper data type
+                torch.nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    torch.nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Embedding):
+                # Initialize embedding with normal distribution
+                torch.nn.init.normal_(m.weight, mean=0, std=0.1)
+            elif isinstance(m, nn.LayerNorm):
+                # Initialize LayerNorm with proper data types
+                torch.nn.init.ones_(m.weight)
+                torch.nn.init.zeros_(m.bias)
+
+        self.model.apply(init_weights_proper)
+
+        # Use AdamW for better regularization with configurable learning rate
+        # Increase weight decay for stronger regularization
+        # Use amsgrad variant for more stable training
+        self.optimizer = optim.AdamW(self.model.parameters(), lr=lr, weight_decay=5e-3, amsgrad=True)
+
+        # Use CosineAnnealingWarmRestarts for more sophisticated LR scheduling
+        # This allows the model to explore different regions of the loss landscape
+        from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+        # Calculate total steps for scheduler
+        self.scheduler = CosineAnnealingWarmRestarts(self.optimizer, T_0=50, T_mult=1, eta_min=1e-6)
+
+        # Binary Cross Entropy with Logits (Combined Sigmoid + BCELoss for stability)
+        # Using pos_weight to handle class imbalance if needed (future upgrade)
+        self.criterion = nn.BCEWithLogitsLoss()
+
+        self.logger.info(f"Model built with Input Dim: {input_dim}, d_model: {d_model}, nhead: {nhead}, num_layers: {num_layers}, dropout: {dropout}, lr: {lr}")
+
+    def train_model(self, df: pd.DataFrame, target_col='target_up', epochs=10, batch_size=32):
+        """
+        Train the model on provided DataFrame using Lazy Loader.
+        """
+        if not HAS_TORCH or self.model is None:
+            self.logger.warning("Cannot train: Torch missing or model not built.")
+            return
+            
+        # Prepare Data
+        # Filter features
+        try:
+            data = df[self.features]
+        except KeyError as e:
+            self.logger.error(f"Training features missing in DF: {e}")
+            return
+
+        target = df[target_col] # Expecting binary 0/1 target
+        
+        loader = create_lazy_loader(data, target, self.window_size, batch_size)
+        
+        if loader is None or len(loader) == 0:
+            self.logger.warning("Not enough data to train.")
+            return
+            
+        self.model.train()
+        for epoch in range(epochs):
+            total_loss = 0
+            batch_count = 0
+            for batch_X, batch_y in loader:
+                # Lazy loader returns tensors directly
+                batch_X = batch_X.to(self.device).float()
+                # Convert targets to long for CrossEntropyLoss (expects class indices)
+                batch_y = batch_y.to(self.device).long().squeeze()  # Ensure targets are long integers
+
+                self.optimizer.zero_grad()
+                outputs = self.model(batch_X)
+                loss = self.criterion(outputs, batch_y)
+                loss.backward()
+                
+                # Gradient Clipping to prevent explosion
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                
+                self.optimizer.step()
+                
+                total_loss += loss.item()
+                batch_count += 1
+            
+            if batch_count > 0:
+                avg_loss = total_loss / batch_count
+                # Step the scheduler
+                if hasattr(self, 'scheduler'):
+                    self.scheduler.step(avg_loss)
+                
+                current_lr = self.optimizer.param_groups[0]['lr']
+                self.logger.info(f"Epoch {epoch+1}/{epochs} - Loss: {avg_loss:.4f} - LR: {current_lr:.6f}")
+            
+    def load_scaler(self, scaler_path: str):
+        """Load the feature scaler from a pickle file."""
+        if not os.path.exists(scaler_path):
+            self.logger.warning(f"Scaler file not found: {scaler_path}")
+            return
+        
+        try:
+            with open(scaler_path, 'rb') as f:
+                self.scaler = pickle.load(f)
+            self.logger.info(f"Scaler loaded from {scaler_path}")
+            
+            # Auto-detect features from scaler if available
+            if hasattr(self.scaler, 'feature_names_in_'):
+                self.features = self.scaler.feature_names_in_.tolist()
+                self.logger.info(f"Auto-configured {len(self.features)} features from scaler.")
+            elif hasattr(self.scaler, 'n_features_in_'):
+                # Fallback if names aren't saved (older sklearn), checking dimension later
+                self.logger.info(f"Scaler expects {self.scaler.n_features_in_} features.")
+        except Exception as e:
+            self.logger.error(f"Failed to load scaler: {e}")
+
+    def generate_signal(self, df: pd.DataFrame, symbol: str = "") -> int:
+        """
+        Generate Buy(1)/Sell(-1)/Hold(0) signal based on latest window.
+        """
+        if not HAS_TORCH or self.model is None:
+            return 0
+            
+        if len(df) < self.window_size:
+            return 0
+
+        # Dynamic Feature & Scaling Logic
+        if hasattr(self, 'scaler') and self.scaler:
+            # 1. Update features list if possible
+            if hasattr(self.scaler, 'feature_names_in_'):
+                # Strict alignment: use exactly the features the scaler expects
+                required_features = self.scaler.feature_names_in_.tolist()
+                # Check if all required features exist
+                missing = [f for f in required_features if f not in df.columns]
+                
+                if missing:
+                    self.logger.warning(f"Feature mismatch: Filling {len(missing)} missing features with training mean (neutral).")
+                    # impute missing features with mean from scaler to get 0 after normalization
+                    if hasattr(self.scaler, 'mean_'):
+                        feature_map = dict(zip(required_features, self.scaler.mean_))
+                        for m in missing:
+                             # Fill with mean so transform -> 0
+                            df[m] = feature_map.get(m, 0.0) 
+                    else:
+                         # Fallback if no mean_ (unlikely for StandardScaler)
+                         for m in missing:
+                            df[m] = 0.0
+                
+                self.features = required_features
+            
+            # 2. Select and Scale Data
+            try:
+                # Select the exact features
+                feature_data = df[self.features].iloc[-self.window_size:]
+                
+                # Check dimension
+                if feature_data.shape[1] != self.scaler.n_features_in_:
+                     # If previous step relied on self.features list which was wrong
+                     self.logger.error(f"Feature count mismatch. Strategy: {feature_data.shape[1]}, Scaler: {self.scaler.n_features_in_}")
+                     return 0
+
+                # SCALE THE DATA (Crucial!)
+                scaled_window = self.scaler.transform(feature_data)
+                
+            except Exception as e:
+                self.logger.error(f"Error during feature scaling: {e}")
+                return 0
+        else:
+            # Fallback for un-normalized raw data (Not recommended for Transformer)
+            self.logger.warning("No scaler loaded! Models trained on scaled data will fail with raw input.")
+            try:
+                # Ensure we only pick numeric columns
+                numeric_df = df.select_dtypes(include=[np.number])
+                # Limit to input dim
+                if self.model.input_dim <= len(numeric_df.columns):
+                     target_cols = numeric_df.columns.tolist()[:self.model.input_dim]
+                else:
+                     target_cols = numeric_df.columns.tolist()
+                
+                scaled_window = df[target_cols].iloc[-self.window_size:].values
+            except KeyError:
+                return 0
+
+        # Predict
+        self.model.eval()
+
+        # NAN SANITIZATION
+        if np.isnan(scaled_window).any():
+            self.logger.warning("Input data contains NaNs after scaling. Replacing with 0.0.")
+            scaled_window = np.nan_to_num(scaled_window, nan=0.0, posinf=0.0, neginf=0.0)
+
+        try:
+            with torch.no_grad():
+                input_tensor = torch.tensor(scaled_window, dtype=torch.float32).unsqueeze(0).to(self.device)
+                logits = self.model(input_tensor)
+
+                # For 3-class classification, get probabilities for each class
+                # logits shape: [1, 3] -> [timeout, stop_loss, take_profit]
+                probs = torch.softmax(logits, dim=1).squeeze(0)  # Shape: [3]
+
+                # Get the predicted class (0=timeout, 1=stop_loss, 2=take_profit)
+                predicted_class = torch.argmax(probs).item()
+
+                # Convert to trading signal:
+                # Class 2 (take_profit) -> Buy signal (1)
+                # Class 1 (stop_loss) -> Sell signal (-1)
+                # Class 0 (timeout) -> Hold signal (0)
+                if predicted_class == 2:  # take_profit
+                    signal = 1  # Buy
+                elif predicted_class == 1:  # stop_loss
+                    signal = -1  # Sell
+                else:  # timeout
+                    signal = 0  # Hold
+
+                # Log probabilities for each class
+                timeout_prob, stop_loss_prob, take_profit_prob = probs[0].item(), probs[1].item(), probs[2].item()
+
+                if np.isnan(timeout_prob) or np.isnan(stop_loss_prob) or np.isnan(take_profit_prob):
+                    self.logger.error("Model predicted NaN! Defaulting to Hold (0)")
+                    return 0
+
+                symbol_tag = f" ({symbol})" if symbol else ""
+                self.logger.info(f"Transformer Prediction - Timeout: {timeout_prob:.4f}, Stop Loss: {stop_loss_prob:.4f}, Take Profit: {take_profit_prob:.4f} -> Signal: {signal} {symbol_tag}")
+
+        except Exception as e:
+            self.logger.error(f"Inference error: {e}")
+            return 0
+
+        return signal
+
+    def save_model(self, path: str):
+        """Save model state dict to path."""
+        if not HAS_TORCH or self.model is None: return
+        torch.save(self.model.state_dict(), path)
+        self.logger.info(f"Model saved to {path}")
+
+    def load_model(self, path: str, input_dim: int):
+        """Load model state dict from path."""
+        if not HAS_TORCH: return
+        
+        # Ensure model is built first
+        if self.model is None:
+            self.build_model(input_dim)
+            
+        if os.path.exists(path):
+            # Map location is crucial for GPU -> CPU transfer
+            self.model.load_state_dict(torch.load(path, map_location=self.device))
+            self.model.eval()
+            self.logger.info(f"Model loaded from {path}")
+        else:
+            self.logger.warning(f"Model file not found: {path}")

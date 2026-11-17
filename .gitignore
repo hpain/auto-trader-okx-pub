@@ -1,0 +1,94 @@
+# Python 缓存文件
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+data/cache/
+
+# 虚拟环境
+venv/
+env/
+.venv/
+ENV/
+env.bak/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# 日志和调试输出
+*.log
+logs/
+debug.log
+
+# 编译/打包输出
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# IDE 配置文件
+.vscode/
+.idea/
+
+# 单元测试缓存
+.pytest_cache/
+.coverage
+.coverage*
+htmlcov/
+
+# 项目特定的敏感与状态文件
+config.yaml
+*.pem
+*.key
+*.crt
+*.bat
+.env
+.env.*
+!.env.example
+*.db
+*.db-shm
+*.db-wal
+status.json
+emergency_stop.flag
+
+# 临时与缓存文件
+*.swp
+*.tmp
+*.bak
+*.parquet
+*.err
+data/cache/
+data/market_context.json
+data/latest_briefing.md
+data/history/*.csv
+!data/history/sample_crypto_news.csv
+
+# 内部备忘与AI对话记录
+.history-memo/
+.qwen/
+.agent/
+
+# 模型与大二进制文件（服务器本地管理）
+models/
+docs/
+research/
+results/
+charts/
+
+# 临时和调试脚本
+scripts/test_*.py
+scripts/debug_*.py
+scripts/diagnose_*.py
+scripts/run_llm_supervisor.py
+scripts/list_gemini_models.py
+scripts/fetch_recent_api.py
+scripts/plot_equity_curve_final.py
+scripts/build_final_model.py
+scripts/check_models.py
+scripts/deploy_paper_windows.ps1
+
+.agent/

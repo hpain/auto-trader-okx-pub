@@ -1,0 +1,169 @@
+exchange:
+  primary_exchange: okx
+  secondary_exchanges: []  # Only use OKX
+exchanges:
+- okx
+- bybit
+derivatives_data:
+  fetch_funding_rates: true
+  fetch_open_interest: true
+okx:
+  api_key: YOUR_API_KEY
+  secret_key: YOUR_SECRET_KEY
+  passphrase: YOUR_PASSPHRASE
+  flag: '0'
+trading:
+  symbols:
+  - BTC/USDT
+  - ETH/USDT
+  interval: 1H
+  strategy: ml
+position_sizing:
+  strategy: fractional
+  fixed_quantity: 0.001
+  risk_per_trade: 0.02
+risk_management:
+  stop_loss_pct: 0.02
+  take_profit_pct: 0.05
+  use_risk_engine: true
+  target_volatility: 0.2
+  volatility_window: 30
+  risk_per_trade: 0.02
+  max_portfolio_risk: 0.1
+strategy_params:
+  ma_crossover:
+    live_fallback:
+      short_window: 5
+      long_window: 20
+    backtest:
+      short_window: 7
+      long_window: 25
+model:
+  target_column: y
+  optuna:
+    direction: maximize
+    metric_to_optimize: sharpe_ratio
+    n_trials: 100
+  hyperparameters:
+    logreg:
+      C_range:
+      - 0.001
+      - 100
+      buy_th_range:
+      - 0.51
+      - 0.7
+      sell_th_range:
+      - 0.3
+      - 0.49
+      fee_range:
+      - 0.0002
+      - 0.001
+    rf:
+      n_estimators_range:
+      - 100
+      - 1000
+      max_depth_range:
+      - 3
+      - 20
+      min_samples_leaf_range:
+      - 1
+      - 10
+    lgb:
+      n_estimators_range:
+      - 100
+      - 1000
+      num_leaves_range:
+      - 20
+      - 150
+      learning_rate_range:
+      - 0.01
+      - 0.3
+      max_depth_range:
+      - 3
+      - 15
+      min_child_samples_range:
+      - 20
+      - 100
+backtest:
+  symbols_to_test:
+  - BTC-USDT
+  - ETH-USDT
+  - SOL-USDT
+  - KDA-USDT
+  - CFX-USDT
+  - DOT-USDT
+paths:
+  model_dir: models
+  feature_cache_dir: data/cache
+  history_data_dir: data/history
+risk_monitoring:
+  daily_loss_threshold: -20.0
+  max_drawdown_threshold: 0.1
+  max_consecutive_losses: 5
+  max_single_loss_pct: -0.03
+  min_account_balance: 900.0
+  email:
+    smtp_server: smtp.gmail.com
+    smtp_port: 587
+    user: your_email@gmail.com
+    password: your_app_password
+    recipients:
+    - admin@yourcompany.com
+strategy_management:
+  enabled_strategies:
+  - lgb          # Primary ML strategy (replaced transformer)
+  - ma_fast
+  - ma_slow
+  # - funding_arb  # Runs in separate process (run_live_simple.py)
+  # - transformer  # Disabled - not performing well with current data
+  funding_arb_strategy:
+    positive_threshold: 0.0001
+    negative_threshold: -0.0001
+  lgb_strategy:
+    model_dir: models
+    model_name: simple_lgb_model.pkl   # Optimized V2: 35 features, 75% @0.60
+    metadata_name: simple_lgb_metadata.json
+    buy_threshold: 0.55  # Balanced (56.6% precision, 129 trades). Use 0.60 for conservative (75% precision)
+    sell_threshold: 0.45
+  transformer_strategy:
+    enabled: false  # Disabled - focus on LGB for now
+    window_size: 120 # Updated after GPU Training (User specified --window 120)
+    buy_threshold: 0.55
+    sell_threshold: 0.45
+    input_dim: 139 # Updated after GPU Training (139 features)
+    model_path: models/transformer_v3.pth
+    scaler_path: models/scaler.pkl
+    model_architecture:
+      d_model: 128
+      nhead: 4 # Assuming default was used
+      num_layers: 3 # Updated to 3 (Fix for "Unexpected key ... layers.2")
+      dim_feedforward: 2048 # Explicitly set to match checkpoint (2048 vs 128*4=512)
+      decoder_hidden_dim: 64 # Match checkpoint structure (Sequential Decoder)
+  ma_fast_strategy:
+    short_window: 5
+    long_window: 15
+  ma_slow_strategy:
+    short_window: 20
+    long_window: 50
+  strategy_switch:
+    lookback_days: 7
+    performance_threshold: 0.5
+news_monitoring:
+  enabled: true
+  check_interval: 60
+  recent_news_window: 5
+  currencies:
+  - BTC
+  - ETH
+  critical_action: emergency_stop
+  warning_action: reduce_position
+  warning_position_multiplier: 0.5
+event_calendar:
+  enabled: true
+  check_days_ahead: 3
+  position_multipliers:
+    CRITICAL: 0.0
+    HIGH: 0.3
+    MEDIUM: 0.5
+    LOW: 1.0
+  custom_events: []

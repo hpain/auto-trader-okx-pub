@@ -1,0 +1,80 @@
+version: '3.3'
+
+services:
+  # Service A: The original ML-driven bot (Price Prediction)
+  auto-trader-ml:
+    build: .
+    container_name: auto-trader-ml
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - OKX_API_KEY=${OKX_API_KEY}
+      - OKX_SECRET_KEY=${OKX_SECRET_KEY}
+      - OKX_PASSPHRASE=${OKX_PASSPHRASE}
+      - OKX_FLAG=${OKX_FLAG:-1} # 从.env读取, 默认1=Sandbox
+    volumes:
+      - .:/app
+      - ./config/settings.yaml:/app/config/settings.yaml
+      - ./logs:/app/logs
+      - ./models:/app/models
+      # Mount the entire data directory to access history, cache, AND market_context.json from supervisor
+      - ./data:/app/data
+      - ./charts:/app/charts
+      - ./status.json:/app/status.json
+    command: python run_live.py # OKX Demo Mode (OKX_FLAG=1)
+
+  # Service B: Funding Arb bot (Structural Alpha)
+  auto-trader-arb:
+    build: .
+    container_name: auto-trader-arb
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - OKX_API_KEY=${OKX_API_KEY}
+      - OKX_SECRET_KEY=${OKX_SECRET_KEY}
+      - OKX_PASSPHRASE=${OKX_PASSPHRASE}
+      - OKX_FLAG=${OKX_FLAG:-0} # Demo mode
+    volumes:
+      - .:/app
+      - ./config/settings.yaml:/app/config/settings.yaml
+      - ./logs:/app/logs
+    command: python run_live_simple.py --strategy funding_arb --symbol ETH/USDT
+
+  # Service C: LLM Supervisor Microservice
+  llm-supervisor:
+    build: .
+    container_name: llm-supervisor
+    restart: always
+    environment:
+      - LLM_API_KEY=${LLM_API_KEY}
+      - LLM_BASE_URL=${LLM_BASE_URL}
+      - LLM_MODEL=${LLM_MODEL}
+      # Exchange keys needed for Supervisor data fetching
+      - OKX_API_KEY=${OKX_API_KEY}
+      - OKX_SECRET_KEY=${OKX_SECRET_KEY}
+      - OKX_PASSPHRASE=${OKX_PASSPHRASE}
+      - OKX_FLAG=${OKX_FLAG:-0}
+    volumes:
+      - .:/app
+      - ./logs:/app/logs
+      - ./data:/app/data
+    command: python scripts/run_supervisor_service.py
+
+  # Service D: Discord Bot (Interactive LLM Assistant)
+  discord-bot:
+    build: .
+    container_name: discord-bot
+    restart: unless-stopped
+    environment:
+      - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN}
+      - DISCORD_OWNER_ID=${DISCORD_OWNER_ID}
+      - DISCORD_CHANNEL_NAME=${DISCORD_CHANNEL_NAME:-trading}
+      - LLM_API_KEY=${LLM_API_KEY}
+      - LLM_MODEL=${LLM_MODEL}
+    volumes:
+      - .:/app
+      - ./data:/app/data
+      - ./logs:/app/logs
+    command: python scripts/discord_bot.py
